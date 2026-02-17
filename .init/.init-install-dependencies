@@ -1,0 +1,4 @@
+{
+    "command": "npm install",
+    "working_directory": "/home/kavia/workspace/code-generation/token-visualization-dashboard-10139/token_metrics_frontend"
+}

@@ -1,11 +1,26 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import './App.css';
 
-import { LineChart } from '@mui/x-charts/LineChart';
+/**
+ * Fix chart import/build issues:
+ * Some @mui/x-charts versions encourage importing from the package root.
+ * This keeps the app building across minor version variations.
+ */
+import { LineChart } from '@mui/x-charts';
 
 /**
- * Convert an ISO timestamp into a short label suitable for the X axis.
- * Example: "14:00", "15:00", ...
+ * @typedef {'hourly'|'weekly'|'monthly'} RangeKey
+ */
+
+const RANGE_OPTIONS = /** @type {{key: RangeKey, label: string, description: string}[]} */ ([
+  { key: 'hourly', label: 'Hourly', description: 'Most recent hourly points' },
+  { key: 'weekly', label: 'Weekly', description: 'Aggregated by day (last 7 days)' },
+  { key: 'monthly', label: 'Monthly', description: 'Aggregated by day (last 30 days)' },
+]);
+
+/**
+ * Convert an ISO timestamp into a short label suitable for an hourly axis.
+ * Example: "14:00"
  */
 function formatHourLabel(isoTimestamp) {
   const d = new Date(isoTimestamp);
@@ -13,17 +28,155 @@ function formatHourLabel(isoTimestamp) {
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
+/**
+ * Convert an ISO timestamp into a short date label suitable for daily aggregation.
+ * Example: "Jan 05"
+ */
+function formatDayLabel(isoTimestamp) {
+  const d = new Date(isoTimestamp);
+  if (Number.isNaN(d.getTime())) return '';
+  return d.toLocaleDateString([], { month: 'short', day: '2-digit' });
+}
+
+/**
+ * Convert a timestamp into a stable "day bucket" key: YYYY-MM-DD (UTC).
+ */
+function toUtcDayKey(isoTimestamp) {
+  const d = new Date(isoTimestamp);
+  if (Number.isNaN(d.getTime())) return '';
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(d.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+/**
+ * Parse YYYY-MM-DD to an ISO-like timestamp for labeling/sorting.
+ */
+function fromUtcDayKeyToIso(dayKey) {
+  if (!dayKey) return '';
+  // Treat as UTC midnight
+  return `${dayKey}T00:00:00.000Z`;
+}
+
+/**
+ * Return a slice of points limited to the requested range.
+ * For hourly: keep as-is.
+ * For weekly/monthly: last 7/30 days based on the newest timestamp.
+ */
+function limitPointsByRange(points, rangeKey) {
+  if (!Array.isArray(points) || points.length === 0) return [];
+  if (rangeKey === 'hourly') return points;
+
+  const last = points[points.length - 1];
+  const lastTs = new Date(last.timestamp);
+  if (Number.isNaN(lastTs.getTime())) return points;
+
+  const windowDays = rangeKey === 'weekly' ? 7 : 30;
+  const windowStart = new Date(lastTs.getTime() - (windowDays - 1) * 24 * 60 * 60 * 1000);
+
+  return points.filter((p) => {
+    const ts = new Date(p.timestamp);
+    if (Number.isNaN(ts.getTime())) return false;
+    return ts >= windowStart && ts <= lastTs;
+  });
+}
+
+/**
+ * Aggregate token points by day (UTC). Sums input/output per day.
+ */
+function aggregateTokensByDay(points) {
+  /** @type {Map<string, {timestamp: string, input_tokens: number, output_tokens: number}>} */
+  const byDay = new Map();
+
+  for (const p of points) {
+    const key = toUtcDayKey(p.timestamp);
+    if (!key) continue;
+
+    const existing = byDay.get(key);
+    if (!existing) {
+      byDay.set(key, {
+        timestamp: fromUtcDayKeyToIso(key),
+        input_tokens: Number(p.input_tokens) || 0,
+        output_tokens: Number(p.output_tokens) || 0,
+      });
+    } else {
+      existing.input_tokens += Number(p.input_tokens) || 0;
+      existing.output_tokens += Number(p.output_tokens) || 0;
+    }
+  }
+
+  return Array.from(byDay.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([, v]) => v);
+}
+
+/**
+ * Aggregate cost points by day (UTC). Sums total_cost_usd per day.
+ */
+function aggregateCostByDay(points) {
+  /** @type {Map<string, {timestamp: string, total_cost_usd: number}>} */
+  const byDay = new Map();
+
+  for (const p of points) {
+    const key = toUtcDayKey(p.timestamp);
+    if (!key) continue;
+
+    const existing = byDay.get(key);
+    if (!existing) {
+      byDay.set(key, {
+        timestamp: fromUtcDayKeyToIso(key),
+        total_cost_usd: Number(p.total_cost_usd) || 0,
+      });
+    } else {
+      existing.total_cost_usd += Number(p.total_cost_usd) || 0;
+    }
+  }
+
+  return Array.from(byDay.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([, v]) => v);
+}
+
 function getBackendBaseUrl() {
   // CRA exposes env vars prefixed with REACT_APP_
   return (process.env.REACT_APP_BACKEND_URL || '').replace(/\/$/, '');
 }
 
+/**
+ * Segmented control for chart ranges.
+ */
+// PUBLIC_INTERFACE
+function RangeToggle({ value, onChange }) {
+  /** This is a public component for selecting time ranges for charts. */
+  return (
+    <div className="tm-toggle" role="group" aria-label="Chart range">
+      {RANGE_OPTIONS.map((opt) => (
+        <button
+          key={opt.key}
+          type="button"
+          className={`tm-toggle__btn ${value === opt.key ? 'is-active' : ''}`}
+          onClick={() => onChange(opt.key)}
+          aria-pressed={value === opt.key ? 'true' : 'false'}
+          title={opt.description}
+        >
+          {opt.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 // PUBLIC_INTERFACE
 function App() {
+  /** Main dashboard app: fetches metrics and renders charts with range selection. */
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [tokensPoints, setTokensPoints] = useState([]);
   const [costPoints, setCostPoints] = useState([]);
+
+  /** @type {[RangeKey, (v: RangeKey) => void]} */
+  const [range, setRange] = useState('hourly');
 
   const backendBaseUrl = useMemo(() => getBackendBaseUrl(), []);
 
@@ -74,15 +227,49 @@ function App() {
     };
   }, [backendBaseUrl]);
 
-  const tokenXLabels = useMemo(
-    () => tokensPoints.map((p) => formatHourLabel(p.timestamp)),
-    [tokensPoints]
-  );
-  const inputSeries = useMemo(() => tokensPoints.map((p) => p.input_tokens), [tokensPoints]);
-  const outputSeries = useMemo(() => tokensPoints.map((p) => p.output_tokens), [tokensPoints]);
+  const displayTokensPoints = useMemo(() => {
+    const limited = limitPointsByRange(tokensPoints, range);
+    if (range === 'hourly') return limited;
+    return aggregateTokensByDay(limited);
+  }, [tokensPoints, range]);
 
-  const costXLabels = useMemo(() => costPoints.map((p) => formatHourLabel(p.timestamp)), [costPoints]);
-  const costSeries = useMemo(() => costPoints.map((p) => p.total_cost_usd), [costPoints]);
+  const displayCostPoints = useMemo(() => {
+    const limited = limitPointsByRange(costPoints, range);
+    if (range === 'hourly') return limited;
+    return aggregateCostByDay(limited);
+  }, [costPoints, range]);
+
+  const tokenXLabels = useMemo(() => {
+    if (range === 'hourly') return displayTokensPoints.map((p) => formatHourLabel(p.timestamp));
+    return displayTokensPoints.map((p) => formatDayLabel(p.timestamp));
+  }, [displayTokensPoints, range]);
+
+  const inputSeries = useMemo(
+    () => displayTokensPoints.map((p) => Number(p.input_tokens) || 0),
+    [displayTokensPoints]
+  );
+  const outputSeries = useMemo(
+    () => displayTokensPoints.map((p) => Number(p.output_tokens) || 0),
+    [displayTokensPoints]
+  );
+
+  const costXLabels = useMemo(() => {
+    if (range === 'hourly') return displayCostPoints.map((p) => formatHourLabel(p.timestamp));
+    return displayCostPoints.map((p) => formatDayLabel(p.timestamp));
+  }, [displayCostPoints, range]);
+
+  const costSeries = useMemo(
+    () => displayCostPoints.map((p) => Number(p.total_cost_usd) || 0),
+    [displayCostPoints]
+  );
+
+  const rangeLabel = useMemo(() => {
+    if (range === 'hourly') return 'hourly';
+    if (range === 'weekly') return 'daily (last 7 days)';
+    return 'daily (last 30 days)';
+  }, [range]);
+
+  const xAxisLabel = useMemo(() => (range === 'hourly' ? 'Time' : 'Date'), [range]);
 
   return (
     <div className="tm-app">
@@ -120,15 +307,19 @@ function App() {
             <header className="tm-card__header">
               <div>
                 <h2 className="tm-card__title">Tokens</h2>
-                <p className="tm-card__subtitle">Input vs output tokens (hourly)</p>
+                <p className="tm-card__subtitle">Input vs output tokens ({rangeLabel})</p>
               </div>
-              <div className="tm-legend">
-                <span className="tm-legend__item">
-                  <span className="tm-dot tm-dot--primary" aria-hidden="true" /> Input
-                </span>
-                <span className="tm-legend__item">
-                  <span className="tm-dot tm-dot--success" aria-hidden="true" /> Output
-                </span>
+
+              <div className="tm-card__actions">
+                <RangeToggle value={range} onChange={setRange} />
+                <div className="tm-legend" aria-label="Token chart legend">
+                  <span className="tm-legend__item">
+                    <span className="tm-dot tm-dot--primary" aria-hidden="true" /> Input
+                  </span>
+                  <span className="tm-legend__item">
+                    <span className="tm-dot tm-dot--success" aria-hidden="true" /> Output
+                  </span>
+                </div>
               </div>
             </header>
 
@@ -136,7 +327,7 @@ function App() {
               <LineChart
                 height={320}
                 margin={{ left: 52, right: 18, top: 20, bottom: 40 }}
-                xAxis={[{ scaleType: 'point', data: tokenXLabels, label: 'Time (UTC-ish)' }]}
+                xAxis={[{ scaleType: 'point', data: tokenXLabels, label: xAxisLabel }]}
                 series={[
                   {
                     data: inputSeries,
@@ -163,12 +354,16 @@ function App() {
             <header className="tm-card__header">
               <div>
                 <h2 className="tm-card__title">Total Cost</h2>
-                <p className="tm-card__subtitle">Estimated total cost in USD (hourly)</p>
+                <p className="tm-card__subtitle">Estimated total cost in USD ({rangeLabel})</p>
               </div>
-              <div className="tm-legend">
-                <span className="tm-legend__item">
-                  <span className="tm-dot tm-dot--secondary" aria-hidden="true" /> USD
-                </span>
+
+              <div className="tm-card__actions">
+                <RangeToggle value={range} onChange={setRange} />
+                <div className="tm-legend" aria-label="Cost chart legend">
+                  <span className="tm-legend__item">
+                    <span className="tm-dot tm-dot--secondary" aria-hidden="true" /> USD
+                  </span>
+                </div>
               </div>
             </header>
 
@@ -176,7 +371,7 @@ function App() {
               <LineChart
                 height={320}
                 margin={{ left: 52, right: 18, top: 20, bottom: 40 }}
-                xAxis={[{ scaleType: 'point', data: costXLabels, label: 'Time (UTC-ish)' }]}
+                xAxis={[{ scaleType: 'point', data: costXLabels, label: xAxisLabel }]}
                 series={[
                   {
                     data: costSeries,
